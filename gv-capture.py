@@ -74,7 +74,10 @@ def main():
         # output 3: audio monitor to default sink
         "-map", "1:a", "-c:a", "pcm_s16le", "-f", "pulse",
     ]
-    ff = subprocess.Popen(ff_cmd)
+    # own pgrp: terminal Ctrl-C must not reach ffmpeg directly — the handler
+    # below sends it exactly one SIGINT (two abort the trailer instead of
+    # finalizing the mkv); ffplay stays in this group so Ctrl-C closes it
+    ff = subprocess.Popen(ff_cmd, preexec_fn=os.setpgrp, stdin=subprocess.DEVNULL)
 
     killed = {"flag": False}
 
