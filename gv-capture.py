@@ -2,7 +2,8 @@
 """GV-USB2 FFV1 lossless capture + live preview window + audio monitor.
 
 usage: gv-capture.py [outfile.mkv] [PAL|NTSC] [stereo|mono]
-  - default mixes audio to mono (GV-USB2 sound is single-channel); pass "stereo" for 2ch
+  - default is mono from front-left (the GV-USB2 sound chip is single-channel,
+    and it lands on the left of a stereo stream); pass "stereo" to keep both
   - stop = Ctrl-C, SIGTERM, SIGHUP or close the preview window; the mkv is finalized cleanly
   - outputs: 1) mkv file  2) raw UYVY -> v4l2loopback /dev/video0 (preview)  3) audio -> default sink
   - device overrides: GV_VIDEO, GV_PREVIEW, GV_AUDIO environment variables
