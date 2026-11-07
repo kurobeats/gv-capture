@@ -41,4 +41,6 @@ optional, without it a busy loopback makes ffmpeg fail instead of skipping the p
 
 ## Checks
 
-    python3 tests/test_gv_capture.py   # argument/geometry/command/preflight self-check
+    python3 tests/test_gv_capture.py        # offline: args, command shape, failure paths
+    python3 tests/test_integration.py       # on the capture host: real captures (~3 min)
+    python3 tests/test_integration.py --quick t_pal_mono   # shorter / single test
