@@ -470,6 +470,8 @@ def main():
                 if not shown and ff.poll() is None and not state["stopping"]:
                     print(f"warning: preview failed on {PREVIEW}; recording continues",
                           file=sys.stderr)
+                elif shown and ff.poll() is None and not state["stopping"]:
+                    stop()  # the preview window was closed: the capture stops with it
                 if ff.poll() is None:
                     while not state["stopping"] and ff.poll() is None:
                         check_monitor(state)
