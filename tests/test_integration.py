@@ -143,9 +143,26 @@ def duration(path):
     return float(probe(path)["format"]["duration"])
 
 
+TS_WARN = "non monotonically increasing dts"
+
+
+def decode_report(path):
+    """(real decode errors, timestamp warnings) from a full decode.
+
+    A single duplicate audio dts at stream start is a known pulse/driver artifact:
+    worth counting, but it is not a decode failure.
+    """
+    r = sh(["ffmpeg", "-v", "error", "-i", str(path), "-f", "null", "-"], timeout=180)
+    lines = [line for line in r.stderr.splitlines() if line.strip()]
+    errors = [line for line in lines if TS_WARN not in line]
+    need(r.returncode == 0, f"decode failed: {r.stderr[-400:]}")
+    return errors, len(lines) - len(errors)
+
+
 def decodes_clean(path):
-    r = sh(["ffmpeg", "-v", "error", "-i", str(path), "-f", "null", "-"], timeout=120)
-    need(r.returncode == 0 and not r.stderr.strip(), f"decode errors: {r.stderr[:400]}")
+    errors, ts = decode_report(path)
+    need(not errors, f"decode errors: {errors[:3]}")
+    need(ts == 0, f"{ts} timestamp warnings while decoding {path}")
 
 
 def finalised(rc, log, path, expect_duration=None):
@@ -373,7 +390,7 @@ def t_no_ffplay(tmp):
     out = tmp / "noffplay.mkv"
     bindir = tmp / "bin"
     bindir.mkdir(exist_ok=True)
-    for tool in ("ffmpeg", "v4l2-ctl", "fuser", "pactl"):
+    for tool in ("ffmpeg", "ffprobe", "v4l2-ctl", "fuser", "pactl"):
         src = shutil.which(tool)
         if src:
             link = bindir / tool

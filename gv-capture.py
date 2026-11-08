@@ -5,8 +5,9 @@ usage: gv-capture.py [outfile.mkv] [PAL|NTSC] [stereo|mono]
   - default is mono from front-left (the GV-USB2 sound chip is single-channel,
     and it lands on the left of a stereo stream); pass "stereo" to keep both
   - stop = Ctrl-C, SIGTERM, SIGHUP or close the preview window; the mkv is finalized cleanly
-  - outputs: 1) mkv file  2) raw UYVY -> v4l2loopback /dev/video0 (preview)  3) audio -> default sink
-  - device overrides: GV_VIDEO, GV_PREVIEW, GV_AUDIO environment variables
+  - outputs: mkv file, plus raw UYVY -> v4l2loopback /dev/video0 for the preview window
+  - the audio monitor is its own ffmpeg, so its death never stops the recording
+  - env: GV_VIDEO, GV_PREVIEW, GV_AUDIO, GV_SINK (monitor sink; default = pulse's default)
 
 exit: 0 = finalized and the mkv is non-empty, 1 = refused to start / capture failed,
       2 = bad usage
@@ -26,6 +27,7 @@ PREVIEW = os.environ["GV_PREVIEW"] if "GV_PREVIEW" in os.environ else "/dev/vide
 AUDIO = os.environ.get(
     "GV_AUDIO",
     "alsa_input.usb-I-O_DATA_I-O_DATA_GV-USB2_000000000000001-02.stereo-fallback")
+SINK = os.environ.get("GV_SINK", "")  # empty = whatever pulse calls the default
 
 PROFILES = {
     # PAL: rows 0-6 and 575 are blanked (TW9910 delivers 576, ~568 active)
@@ -103,11 +105,15 @@ def audio_source():
 def default_sink():
     """(sink, note) for the audio monitor; sink is None when there is nowhere to play."""
     if not shutil.which("pactl"):
-        return "default", None
+        return SINK or "default", None
     r = subprocess.run(["pactl", "list", "short", "sinks"], capture_output=True, text=True)
     if r.returncode != 0:
-        return "default", None
+        return SINK or "default", None
     names = [line.split()[1] for line in r.stdout.splitlines() if len(line.split()) > 1]
+    if SINK:
+        if SINK in names:
+            return SINK, None
+        return None, f"GV_SINK={SINK} is not an audio sink; audio monitor disabled"
     if not names:
         return None, "no audio sink found; audio monitor disabled"
     d = subprocess.run(["pactl", "get-default-sink"], capture_output=True, text=True)
@@ -128,7 +134,7 @@ def check_space(path):
 
 
 def preflight(out):
-    for tool in ("ffmpeg", "v4l2-ctl"):
+    for tool in ("ffmpeg", "ffprobe", "v4l2-ctl"):
         if not shutil.which(tool):
             die(f"{tool} not found in PATH")
     if not os.path.exists(VIDEO):
@@ -150,7 +156,74 @@ def desktop_env():
     os.environ.setdefault("SDL_VIDEODRIVER", "x11")  # SDL here has no wayland backend
 
 
-def ffmpeg_cmd(out, std, stereo, prof, src, preview, monitor="default"):
+def monitor_cmd(src, sink, stereo):
+    """The audio monitor, as a separate process from the recorder.
+
+    ffmpeg's pulse *output* ignores the device in the URL and always plays to the
+    default sink, so the sink is selected with PULSE_SINK in the environment.
+    """
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-nostdin",
+           "-f", "pulse", "-i", src]
+    if not stereo:  # mono source on front-left: average-downmixing just loses 6 dB
+        cmd += ["-af", MONO_MAP]
+    return cmd + ["-c:a", "pcm_s16le", "-f", "pulse", sink]
+
+
+def start_monitor(src, sink, stereo):
+    env = dict(os.environ)
+    if sink != "default":
+        env["PULSE_SINK"] = sink
+    try:
+        return subprocess.Popen(monitor_cmd(src, sink, stereo), env=env,
+                                stdin=subprocess.DEVNULL)
+    except OSError as e:
+        print(f"warning: cannot start the audio monitor: {e}", file=sys.stderr)
+        return None
+
+
+def monitor_feedback(sink, src):
+    """True when monitoring would play into the sink it records from: a howl loop."""
+    return bool(sink) and src.endswith(".monitor") and src[:-len(".monitor")] == sink
+
+
+def check_monitor(state):
+    """Report a dead audio monitor once. It must never stop the recording.
+
+    A monitor that went away because we are stopping is expected, not news.
+    """
+    mon = state.get("monitor")
+    if mon is None or state.get("monitor_warned") or state.get("stopping"):
+        return
+    if mon.poll() is None:
+        return
+    state["monitor_warned"] = True
+    print(f"warning: audio monitor stopped (exit {mon.returncode}); recording continues",
+          file=sys.stderr)
+
+
+def media_duration(path):
+    r = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                        "-of", "default=nw=1:nk=1", str(path)],
+                       capture_output=True, text=True)
+    try:
+        return float(r.stdout.strip())
+    except ValueError:
+        return None
+
+
+def audio_peak(path, at):
+    """Peak level in dB of ~2 s of the recorded audio, or None if there is no audio."""
+    r = subprocess.run(["ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "info",
+                        "-ss", f"{at:.3f}", "-t", "2", "-i", str(path), "-map", "0:a:0",
+                        "-af", "volumedetect", "-f", "null", "-"],
+                       capture_output=True, text=True)
+    m = re.search(r"max_volume:\s*(-?[\d.]+|-inf) dB", r.stderr)
+    if not m:
+        return None
+    return float("-inf") if m.group(1) == "-inf" else float(m.group(1))
+
+
+def ffmpeg_cmd(out, std, stereo, prof, src, preview):
     ff_cmd = [
         "ffmpeg", "-hide_banner", "-loglevel", "warning", "-nostdin", "-n",
         "-f", "v4l2", "-video_size", prof["size"], "-pix_fmt", "uyvy422", "-i", VIDEO,
@@ -167,11 +240,6 @@ def ffmpeg_cmd(out, std, stereo, prof, src, preview, monitor="default"):
     if preview:  # output 2: loopback preview (unfiltered, i.e. full frame geometry)
         ff_cmd += ["-map", "0:v", "-c:v", "rawvideo", "-pix_fmt", "uyvy422",
                    "-f", "v4l2", PREVIEW]
-    # output 3: audio monitor. The sink name is not optional: "-f pulse" without a
-    # filename is dropped by ffmpeg as trailing options and nothing plays.
-    if monitor:
-        ff_cmd += ["-map", "1:a"] + ([] if stereo else ["-af", MONO_MAP])
-        ff_cmd += ["-c:a", "pcm_s16le", "-f", "pulse", monitor]
     return ff_cmd
 
 
@@ -211,6 +279,7 @@ def wait_player(p, ff, state):
             pass
         except KeyboardInterrupt:
             return None
+        check_monitor(state)  # the preview loop is where we mostly sit
         if ff.poll() is not None or state["stopping"]:
             p.terminate()
             try:
@@ -309,7 +378,8 @@ def main():
     print("Ctrl-C or close the preview window to stop")
     sys.stdout.flush()
 
-    state = {"stopping": False, "signalled": False, "player": None, "ff": None}
+    state = {"stopping": False, "signalled": False, "player": None, "ff": None,
+             "monitor": None, "monitor_warned": False}
 
     def on_signal(_sig=None, _frm=None):
         state["signalled"] = True
@@ -323,6 +393,9 @@ def main():
         player = state["player"]
         if player is not None and player.poll() is None:
             player.terminate()  # a SIGTERM must not leave the preview blocking us
+        mon = state["monitor"]
+        if mon is not None and mon.poll() is None:
+            mon.terminate()
         ff = state["ff"]
         if ff is not None and ff.poll() is None:
             ff.send_signal(signal.SIGINT)
@@ -337,15 +410,23 @@ def main():
         # above sends it exactly one SIGINT (two abort the trailer instead of
         # finalizing the mkv); ffplay stays in this group so Ctrl-C closes it
         ff = state["ff"] = subprocess.Popen(
-            ffmpeg_cmd(out, std, stereo, prof, src, preview, monitor),
+            ffmpeg_cmd(out, std, stereo, prof, src, preview),
             preexec_fn=os.setpgrp, stdin=subprocess.DEVNULL)
     except OSError as e:
         die(f"cannot start ffmpeg: {e}")
+
+    if monitor and monitor_feedback(monitor, src):
+        print(f"warning: the audio monitor would play into the sink it records from "
+              f"({monitor}); skipping it to avoid feedback", file=sys.stderr)
+        monitor = None
+    if monitor:  # separate process: if it dies, the recording keeps going
+        state["monitor"] = start_monitor(src, monitor, stereo)
 
     try:
         if not preview:
             if ff.poll() is None:
                 while not state["stopping"] and ff.poll() is None:
+                    check_monitor(state)
                     time.sleep(0.2)
         else:
             geo = wait_preview(ff)
@@ -360,12 +441,20 @@ def main():
                           file=sys.stderr)
                 if ff.poll() is None:
                     while not state["stopping"] and ff.poll() is None:
+                        check_monitor(state)
                         time.sleep(0.2)
     except KeyboardInterrupt:
         pass
     finally:
         stop()
         rc = finalize(ff)
+        mon = state["monitor"]
+        if mon is not None:
+            try:
+                mon.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                mon.kill()
+            check_monitor(state)
 
     size = Path(out).stat().st_size if Path(out).exists() else 0
     if not size:
@@ -379,7 +468,17 @@ def main():
     if rc not in GRACEFUL_RC and not state["signalled"]:
         die(f"ffmpeg exited unexpectedly ({rc}); {out} ({size / 2 ** 30:.2f} GiB) "
             f"may be truncated")
-    print(f"done: {out} ({size / 2 ** 30:.2f} GiB)")
+    dur = media_duration(out)
+    peak = audio_peak(out, dur / 2 if dur and dur > 4 else 1.0)
+    note = ""
+    if peak is None:
+        print("warning: the mkv has no audio track", file=sys.stderr)
+    elif peak <= -80:
+        print("warning: the audio track is silent; check the source, its level, and "
+              "that GV_AUDIO points at it", file=sys.stderr)
+    else:
+        note = f", audio peak {peak:.1f} dBFS"
+    print(f"done: {out} ({size / 2 ** 30:.2f} GiB{note})")
 
 
 if __name__ == "__main__":

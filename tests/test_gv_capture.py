@@ -122,18 +122,16 @@ def cmd_full_shape():
     assert cmd[0] == "ffmpeg" and "-nostdin" in cmd and "-n" in cmd  # never clobber
     assert cmd[cmd.index("-vf") + 1] == "setfield=tff,crop=720:566:0:8"
     assert cmd[cmd.index("-i") + 1] == gv.VIDEO
-    assert cmd.count("-map") == 4, cmd  # 2 file, 1 preview, 1 monitor
+    assert cmd.count("-map") == 3, cmd  # video+audio to the file, video to the preview
     assert cmd.index("/tmp/out.mkv") < cmd.index(gv.PREVIEW)
-    assert cmd[-3:] == ["-f", "pulse", "default"], cmd  # monitor last, with its sink
     assert "-y" not in cmd
 
 
 @check
-def cmd_mono_maps_left_channel_on_file_and_monitor():
+def cmd_mono_maps_left_channel_on_file():
     cmd = gv.ffmpeg_cmd("/tmp/out.mkv", "PAL", False, gv.PROFILES["PAL"], "src", True)
     assert cmd[cmd.index("-af") + 1] == gv.MONO_MAP
-    assert cmd.index("-af") < cmd.index("/tmp/out.mkv") < cmd.index(gv.PREVIEW)
-    assert cmd[cmd.index("-af", cmd.index(gv.PREVIEW)) + 1] == gv.MONO_MAP
+    assert cmd.index("-af") < cmd.index("/tmp/out.mkv")
 
 
 @check
@@ -145,13 +143,8 @@ def cmd_stereo_leaves_channels_alone():
 @check
 def cmd_optional_outputs():
     no_prev = gv.ffmpeg_cmd("/tmp/o.mkv", "NTSC", True, gv.PROFILES["NTSC"], "src", False)
-    assert no_prev.count("-map") == 3 and gv.PREVIEW not in no_prev
-    no_mon = gv.ffmpeg_cmd("/tmp/o.mkv", "PAL", False, gv.PROFILES["PAL"], "src",
-                           False, None)
-    assert no_mon.count("-map") == 2 and no_mon.count("pulse") == 1  # input only
-    neither = gv.ffmpeg_cmd("/tmp/o.mkv", "PAL", True, gv.PROFILES["PAL"], "src",
-                            False, None)
-    assert neither.count("-map") == 2 and "v4l2" in neither  # capture input only
+    assert no_prev.count("-map") == 2 and gv.PREVIEW not in no_prev
+    assert "pulse" in no_prev  # the audio input stays; the monitor is a separate process
 
 
 # ---------------------------------------------------------------- preflight
@@ -221,7 +214,7 @@ def audio_source_prefers_config_and_falls_back():
 
 @check
 def default_sink_resolution():
-    sinks = "1\talsa_output.pci.analog-stereo\tx\n2\talsa_output.usb.razer\tx\n"
+    sinks = "1\talsa_output.pci.analog-stereo\tx\n2\talsa_output.usb-headset\tx\n"
     with patch(owner=gv.shutil, which=lambda _t: None):
         assert gv.default_sink() == ("default", None)  # no pactl: let pulse decide
     with patch(owner=gv.shutil, which=lambda t: "/usr/bin/" + t), \
@@ -239,11 +232,108 @@ def default_sink_resolution():
     def run_default(cmd, **kw):
         if cmd[1:3] == ["list", "short"]:
             return subprocess.CompletedProcess(cmd, 0, sinks, "")
-        return subprocess.CompletedProcess(cmd, 0, "alsa_output.usb.razer\n", "")
+        return subprocess.CompletedProcess(cmd, 0, "alsa_output.usb-headset\n", "")
 
     with patch(owner=gv.shutil, which=lambda t: "/usr/bin/" + t), \
          patch(owner=gv.subprocess, run=run_default):
-        assert gv.default_sink() == ("alsa_output.usb.razer", None)
+        assert gv.default_sink() == ("alsa_output.usb-headset", None)
+
+
+# ---------------------------------------------------------------- audio monitor
+@check
+def monitor_is_a_separate_process_with_pulse_sink():
+    cmd = gv.monitor_cmd("src", "alsa_output.speakers", False)
+    assert cmd[0] == "ffmpeg" and "-c:v" not in cmd  # never the recorder
+    assert cmd[cmd.index("-i") + 1] == "src" and cmd[-3:] == ["-f", "pulse",
+                                                              "alsa_output.speakers"]
+    assert cmd[cmd.index("-af") + 1] == gv.MONO_MAP
+    stereo = gv.monitor_cmd("src", "sink", True)
+    assert "-af" not in stereo  # stereo mode passes both channels through
+
+    started = {}
+    with patch(owner=gv.subprocess,
+               Popen=lambda cmd, **kw: started.update(cmd=cmd, env=kw.get("env")) or None):
+        assert gv.start_monitor("src", "sink.name", True) is None  # fake returns None
+        # ffmpeg's pulse output ignores the URL device: routing needs PULSE_SINK
+        assert started["env"]["PULSE_SINK"] == "sink.name"
+        gv.start_monitor("src", "default", True)
+        assert "PULSE_SINK" not in started["env"]  # let pulse pick its own default
+    with patch(owner=gv.subprocess,
+               Popen=lambda *a, **k: (_ for _ in ()).throw(OSError("boom"))):
+        out = io.StringIO()
+        with contextlib.redirect_stderr(out):
+            assert gv.start_monitor("src", "sink", True) is None
+        assert "cannot start the audio monitor" in out.getvalue()
+
+
+@check
+def dead_monitor_warns_once_and_never_fails():
+    class Mon:
+        returncode = 3
+
+        def poll(self):
+            return 3
+
+    out = io.StringIO()
+    state = {"monitor": Mon()}
+    with contextlib.redirect_stderr(out):
+        gv.check_monitor(state)
+        gv.check_monitor(state)  # second call must stay quiet
+        gv.check_monitor({"monitor": None})  # no monitor configured
+        class Running:
+            def poll(self):
+                return None
+
+        gv.check_monitor({"monitor": Running()})  # still running
+    text = out.getvalue()
+    assert text.count("audio monitor stopped") == 1, text
+    assert "recording continues" in text
+
+
+@check
+def audio_peak_and_duration_parsing():
+    def run_with(stderr, stdout=""):
+        return lambda *a, **k: subprocess.CompletedProcess(a, 0, stdout, stderr)
+
+    with patch(owner=gv.subprocess, run=run_with("max_volume: -24.1 dB\n")):
+        assert gv.audio_peak("/tmp/x.mkv", 3) == -24.1
+    with patch(owner=gv.subprocess, run=run_with("max_volume: -inf dB\n")):
+        assert gv.audio_peak("/tmp/x.mkv", 3) == float("-inf")
+    with patch(owner=gv.subprocess, run=run_with("no such stream\n")):
+        assert gv.audio_peak("/tmp/x.mkv", 3) is None
+    with patch(owner=gv.subprocess, run=run_with("", "12.5\n")):
+        assert gv.media_duration("/tmp/x.mkv") == 12.5
+    with patch(owner=gv.subprocess, run=run_with("", "N/A\n")):
+        assert gv.media_duration("/tmp/x.mkv") is None
+
+
+@check
+def monitor_feedback_is_detected():
+    """GV_SINK behind GV_AUDIO would howl: the monitor must be skipped."""
+    sink = "alsa_output.speakers"
+    assert gv.monitor_feedback(sink, f"{sink}.monitor") is True
+    assert gv.monitor_feedback(sink, "alsa_input.usb-card.analog-stereo") is False
+    assert gv.monitor_feedback("other-sink", f"{sink}.monitor") is False
+    assert gv.monitor_feedback("default", f"{sink}.monitor") is False
+    assert gv.monitor_feedback(None, f"{sink}.monitor") is False
+
+
+@check
+def gv_sink_override_is_honoured():
+    sinks = "1\talsa_output.speakers\tx\n2\talsa_output.headset\tx\n"
+    with patch(SINK="alsa_output.headset", owner=gv), \
+         patch(owner=gv.shutil, which=lambda t: "/usr/bin/" + t), \
+         patch(owner=gv.subprocess, run=fake_run(rc=0, stdout=sinks)):
+        assert gv.default_sink() == ("alsa_output.headset", None)
+    with patch(SINK="alsa_output.nope", owner=gv), \
+         patch(owner=gv.shutil, which=lambda t: "/usr/bin/" + t), \
+         patch(owner=gv.subprocess, run=fake_run(rc=0, stdout=sinks)):
+        sink, note = gv.default_sink()
+        assert sink is None and "GV_SINK=alsa_output.nope" in note
+    # no pactl: pass the override through and let pulse resolve it
+    with patch(SINK="alsa_output.headset", owner=gv), \
+         patch(owner=gv.shutil, which=lambda _t: None):
+        assert gv.default_sink() == ("alsa_output.headset", None)
 
 
 # ---------------------------------------------------------------- preview
@@ -419,8 +509,15 @@ class FakeFFProc:
 
     def __init__(self, out=None, rc=0, alive_polls=0):
         self.rc, self.signals, self.alive = rc, [], alive_polls
+        self.returncode = rc
         if out:
             Path(out).write_bytes(b"x" * 100000)
+
+    def terminate(self):
+        self.signals.append("TERM")
+
+    def kill(self):
+        self.signals.append("KILL")
 
     def poll(self):
         if self.alive > 0:
@@ -446,10 +543,12 @@ def main_happy_path_finalizes():
         proc_holder = {}
 
         def popen(cmd, **kw):
-            if cmd[0] == "ffmpeg":
+            if "-c:v" in cmd:  # the recorder
                 proc_holder["ff"] = FakeFFProc(out=out, rc=0, alive_polls=1)
                 return proc_holder["ff"]
-            return FakeProc(0)  # ffplay: closed immediately
+            if cmd[0] == "ffplay":
+                return FakeProc(0)  # preview closed immediately
+            return FakeFFProc(rc=0)  # audio monitor
 
         def run(cmd, **kw):
             # fuser: 1 = nothing holds the loopback; everything else succeeds
@@ -465,7 +564,8 @@ def main_happy_path_finalizes():
                  patch(owner=gv.subprocess, Popen=popen, run=run), \
                  patch(owner=gv.time, sleep=lambda _s: None), \
                  patch(owner=gv, check_space=lambda _p: None,
-                       audio_source=lambda: "src", default_sink=lambda: ("default", None)):
+                       audio_source=lambda: "src", default_sink=lambda: ("default", None),
+                       media_duration=lambda _p: 6.0, audio_peak=lambda _p, _a: -20.0):
                 printed = io.StringIO()
                 with contextlib.redirect_stdout(printed):
                     gv.main()
@@ -483,7 +583,9 @@ def main_reports_nothing_written():
         device.write_bytes(b"")
 
         def popen(cmd, **kw):
-            return FakeFFProc(out=None, rc=1) if cmd[0] == "ffmpeg" else FakeProc(0)
+            if "-c:v" in cmd:
+                return FakeFFProc(out=None, rc=1)
+            return FakeProc(0) if cmd[0] == "ffplay" else FakeFFProc(rc=0)
 
         argv = sys.argv
         sys.argv = ["gv-capture.py", out]
@@ -495,7 +597,8 @@ def main_reports_nothing_written():
                  patch(owner=gv.time, sleep=lambda _s: None), \
                  patch(owner=gv, check_space=lambda _p: None,
                        audio_source=lambda: "src",
-                       default_sink=lambda: ("default", None)):
+                       default_sink=lambda: ("default", None),
+                       media_duration=lambda _p: 6.0, audio_peak=lambda _p, _a: -20.0):
                 assert "nothing written" in expect_exit(1, gv.main)
         finally:
             sys.argv = argv
@@ -509,10 +612,10 @@ def main_deletes_header_only_mkv():
         device.write_bytes(b"")
 
         def popen(cmd, **kw):
-            if cmd[0] == "ffmpeg":
+            if "-c:v" in cmd:
                 Path(out).write_bytes(b"tiny")  # header only, ffmpeg failed
                 return FakeFFProc(out=None, rc=234)
-            return FakeProc(0)
+            return FakeProc(0) if cmd[0] == "ffplay" else FakeFFProc(rc=0)
 
         argv = sys.argv
         sys.argv = ["gv-capture.py", out]
@@ -524,7 +627,8 @@ def main_deletes_header_only_mkv():
                  patch(owner=gv.time, sleep=lambda _s: None), \
                  patch(owner=gv, check_space=lambda _p: None,
                        audio_source=lambda: "src",
-                       default_sink=lambda: ("default", None)):
+                       default_sink=lambda: ("default", None),
+                       media_duration=lambda _p: 6.0, audio_peak=lambda _p, _a: -20.0):
                 assert "failed at startup" in expect_exit(1, gv.main)
             assert not Path(out).exists()
         finally:
