@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """GV-USB2 FFV1 lossless capture + live preview window + audio monitor.
 
-usage: gv-capture.py [outfile.mkv] [PAL|NTSC] [stereo|mono]
-  - default is mono from front-left (the GV-USB2 sound chip is single-channel,
-    and it lands on the left of a stereo stream); pass "stereo" to keep both
+usage: gv-capture.py [outfile.mkv] [PAL|NTSC] [mono]
+  - audio keeps the source layout by default; pass "mono" to mix both channels down
   - stop = Ctrl-C, SIGTERM, SIGHUP or close the preview window; the mkv is finalized cleanly
   - outputs: mkv file, plus raw UYVY -> v4l2loopback /dev/video0 for the preview window
   - the audio monitor is its own ffmpeg, so its death never stops the recording
@@ -37,7 +36,20 @@ PROFILES = {
 }
 STOP_TIMEOUT = 120  # seconds to let ffmpeg write the trailer before we force it
 GRACEFUL_RC = (0, 130, 255, -signal.SIGINT, -signal.SIGTERM, -signal.SIGHUP)
-MONO_MAP = "pan=mono|c0=c0"  # the only live channel; keeps full level
+# Mono mixing. ffmpeg's -ac 1 is not an honest average in this pipeline: measured
+# -3 dB for a signal on one channel only and +3 dB for common-mode content (which
+# clips at full scale). Be explicit instead, and only when there are two channels.
+MONO_AVERAGE = ["-af", "pan=mono|c0=0.5*c0+0.5*c1"]
+MONO_FALLBACK = ["-ac", "1"]  # unknown layout: let ffmpeg cope with any channel count
+
+
+def mono_args(channels):
+    """Arguments that mix a source down to mono without losing or boosting level."""
+    if channels is None:
+        return list(MONO_FALLBACK)
+    if channels == 2:
+        return list(MONO_AVERAGE)
+    return []  # already mono: nothing to mix
 
 GEO_RE = re.compile(r"Width/Height\s*:\s*(\d+)/(\d+)")
 
@@ -49,12 +61,12 @@ def die(msg, code=1):
 
 def usage(code=2):
     print(__doc__.strip() if code == 0 else "usage: gv-capture.py [outfile.mkv] "
-          "[PAL|NTSC] [stereo|mono]", file=sys.stdout if code == 0 else sys.stderr)
+          "[PAL|NTSC] [mono]", file=sys.stdout if code == 0 else sys.stderr)
     sys.exit(code)
 
 
 def parse_args(argv):
-    out, std, stereo, std_set = None, "PAL", False, False
+    out, std, stereo, std_set = None, "PAL", True, False  # layout untouched by default
     for a in argv:
         if a in ("-h", "--help"):
             usage(0)
@@ -63,7 +75,7 @@ def parse_args(argv):
                 usage()  # two standards: ambiguous, don't guess
             std, std_set = a.upper(), True
         elif a.lower() in ("stereo", "mono"):
-            stereo = a.lower() == "stereo"
+            stereo = a.lower() == "stereo"  # "stereo" is accepted for symmetry
         elif a.startswith("-"):
             usage()
         elif out is None:
@@ -100,6 +112,26 @@ def audio_source():
         print(f"note: using audio source {gv[0]}", file=sys.stderr)
         return gv[0]
     die(f"no GV-USB2 audio source (set GV_AUDIO). available: {', '.join(names)}")
+
+
+def source_channels(name):
+    """Channel count of a pulse source, or None when it cannot be determined."""
+    if not shutil.which("pactl"):
+        return None
+    r = subprocess.run(["pactl", "list", "sources"], capture_output=True, text=True)
+    if r.returncode != 0:
+        return None
+    block, wanted = [], None
+    for line in r.stdout.splitlines():
+        if line.startswith("Source #"):
+            block = []
+        block.append(line)
+        if line.strip() == f"Name: {name}":
+            wanted = block
+    if wanted is None:
+        return None
+    m = re.search(r"Sample Specification:\s*\w+ (\d+)ch", "\n".join(wanted))
+    return int(m.group(1)) if m else None
 
 
 def default_sink():
@@ -156,7 +188,7 @@ def desktop_env():
     os.environ.setdefault("SDL_VIDEODRIVER", "x11")  # SDL here has no wayland backend
 
 
-def monitor_cmd(src, sink, stereo):
+def monitor_cmd(src, sink, mono):
     """The audio monitor, as a separate process from the recorder.
 
     ffmpeg's pulse *output* ignores the device in the URL and always plays to the
@@ -164,17 +196,16 @@ def monitor_cmd(src, sink, stereo):
     """
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-nostdin",
            "-f", "pulse", "-i", src]
-    if not stereo:  # mono source on front-left: average-downmixing just loses 6 dB
-        cmd += ["-af", MONO_MAP]
+    cmd += mono
     return cmd + ["-c:a", "pcm_s16le", "-f", "pulse", sink]
 
 
-def start_monitor(src, sink, stereo):
+def start_monitor(src, sink, mono):
     env = dict(os.environ)
     if sink != "default":
         env["PULSE_SINK"] = sink
     try:
-        return subprocess.Popen(monitor_cmd(src, sink, stereo), env=env,
+        return subprocess.Popen(monitor_cmd(src, sink, mono), env=env,
                                 stdin=subprocess.DEVNULL)
     except OSError as e:
         print(f"warning: cannot start the audio monitor: {e}", file=sys.stderr)
@@ -223,7 +254,7 @@ def audio_peak(path, at):
     return float("-inf") if m.group(1) == "-inf" else float(m.group(1))
 
 
-def ffmpeg_cmd(out, std, stereo, prof, src, preview):
+def ffmpeg_cmd(out, std, mono, prof, src, preview):
     ff_cmd = [
         "ffmpeg", "-hide_banner", "-loglevel", "warning", "-nostdin", "-n",
         "-f", "v4l2", "-video_size", prof["size"], "-pix_fmt", "uyvy422", "-i", VIDEO,
@@ -234,8 +265,7 @@ def ffmpeg_cmd(out, std, stereo, prof, src, preview):
         "-c:v", "ffv1", "-level", "3", "-threads", "4", "-pix_fmt", "yuv422p",
         "-c:a", "aac", "-b:a", "256k",
     ]
-    if not stereo:  # mono source on front-left: average-downmixing just loses 6 dB
-        ff_cmd += ["-af", MONO_MAP]
+    ff_cmd += mono
     ff_cmd += ["-f", "matroska", out]
     if preview:  # output 2: loopback preview (unfiltered, i.e. full frame geometry)
         ff_cmd += ["-map", "0:v", "-c:v", "rawvideo", "-pix_fmt", "uyvy422",
@@ -345,6 +375,7 @@ def main():
     preflight(out)
     src = audio_source()
     monitor, monitor_note = default_sink()
+    mono = [] if stereo else mono_args(source_channels(src))
     if monitor_note:
         print(f"note: {monitor_note}", file=sys.stderr)
 
@@ -410,7 +441,7 @@ def main():
         # above sends it exactly one SIGINT (two abort the trailer instead of
         # finalizing the mkv); ffplay stays in this group so Ctrl-C closes it
         ff = state["ff"] = subprocess.Popen(
-            ffmpeg_cmd(out, std, stereo, prof, src, preview),
+            ffmpeg_cmd(out, std, mono, prof, src, preview),
             preexec_fn=os.setpgrp, stdin=subprocess.DEVNULL)
     except OSError as e:
         die(f"cannot start ffmpeg: {e}")
@@ -420,7 +451,7 @@ def main():
               f"({monitor}); skipping it to avoid feedback", file=sys.stderr)
         monitor = None
     if monitor:  # separate process: if it dies, the recording keeps going
-        state["monitor"] = start_monitor(src, monitor, stereo)
+        state["monitor"] = start_monitor(src, monitor, mono)
 
     try:
         if not preview:

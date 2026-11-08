@@ -65,11 +65,13 @@ def fake_run(rc=0, stdout="", stderr=""):
 # ---------------------------------------------------------------- arguments
 @check
 def args_defaults_and_positionals():
-    assert gv.parse_args([]) == (None, "PAL", False)
-    assert gv.parse_args(["/tmp/a.mkv"]) == ("/tmp/a.mkv", "PAL", False)
+    # source layout by default; "mono" is opt-in
+    assert gv.parse_args([]) == (None, "PAL", True)
+    assert gv.parse_args(["/tmp/a.mkv"]) == ("/tmp/a.mkv", "PAL", True)
     assert gv.parse_args(["/tmp/a.mkv", "ntsc", "STEREO"]) == ("/tmp/a.mkv", "NTSC", True)
     assert gv.parse_args(["stereo", "/tmp/b.mkv", "PAL"]) == ("/tmp/b.mkv", "PAL", True)
     assert gv.parse_args(["/tmp/c.mkv", "mono"]) == ("/tmp/c.mkv", "PAL", False)
+    assert gv.parse_args(["/tmp/c.mkv", "stereo"]) == ("/tmp/c.mkv", "PAL", True)
 
 
 @check
@@ -118,7 +120,8 @@ def profiles_are_consistent():
 # ---------------------------------------------------------------- ffmpeg cmd
 @check
 def cmd_full_shape():
-    cmd = gv.ffmpeg_cmd("/tmp/out.mkv", "PAL", False, gv.PROFILES["PAL"], "src", True)
+    cmd = gv.ffmpeg_cmd("/tmp/out.mkv", "PAL", gv.MONO_AVERAGE, gv.PROFILES["PAL"],
+                        "src", True)
     assert cmd[0] == "ffmpeg" and "-nostdin" in cmd and "-n" in cmd  # never clobber
     assert cmd[cmd.index("-vf") + 1] == "setfield=tff,crop=720:566:0:8"
     assert cmd[cmd.index("-i") + 1] == gv.VIDEO
@@ -128,21 +131,60 @@ def cmd_full_shape():
 
 
 @check
-def cmd_mono_maps_left_channel_on_file():
-    cmd = gv.ffmpeg_cmd("/tmp/out.mkv", "PAL", False, gv.PROFILES["PAL"], "src", True)
-    assert cmd[cmd.index("-af") + 1] == gv.MONO_MAP
+def cmd_mono_downmix_on_file():
+    cmd = gv.ffmpeg_cmd("/tmp/out.mkv", "PAL", gv.MONO_AVERAGE, gv.PROFILES["PAL"],
+                        "src", True)
+    # an explicit average of both channels, never pan=c0 (that would drop one)
+    assert cmd[cmd.index("-af") + 1] == "pan=mono|c0=0.5*c0+0.5*c1"
     assert cmd.index("-af") < cmd.index("/tmp/out.mkv")
+    assert not any("pan=mono|c0=c0" == str(a) for a in cmd)
+
+
+@check
+def mono_args_never_guesses():
+    # two channels: explicit average (measured -6 dB for one live channel, no boost
+    # for common-mode, so it cannot clip)
+    assert gv.mono_args(2) == ["-af", "pan=mono|c0=0.5*c0+0.5*c1"]
+    # already mono: mixing again would only risk breaking the graph
+    assert gv.mono_args(1) == []
+    # unknown layout: fall back to ffmpeg's own downmix, whatever the channel count
+    assert gv.mono_args(None) == ["-ac", "1"]
+    assert gv.mono_args(6) == []  # only stereo is averaged explicitly
+
+
+@check
+def source_channels_parsing():
+    dump = """Source #5
+	State: RUNNING
+	Name: alsa_input.usb-card.analog-stereo
+	Sample Specification: s16le 2ch 48000Hz
+	Channel Map: front-left,front-right
+Source #9
+	Name: alsa_input.usb-mic.mono-fallback
+	Sample Specification: s16le 1ch 48000Hz
+	Channel Map: mono
+"""
+    with patch(owner=gv.shutil, which=lambda t: "/usr/bin/" + t), \
+         patch(owner=gv.subprocess, run=fake_run(rc=0, stdout=dump)):
+        assert gv.source_channels("alsa_input.usb-card.analog-stereo") == 2
+        assert gv.source_channels("alsa_input.usb-mic.mono-fallback") == 1
+        assert gv.source_channels("alsa_input.unknown") is None
+    with patch(owner=gv.shutil, which=lambda _t: None):
+        assert gv.source_channels("anything") is None
+    with patch(owner=gv.shutil, which=lambda t: "/usr/bin/" + t), \
+         patch(owner=gv.subprocess, run=fake_run(rc=3)):
+        assert gv.source_channels("anything") is None
 
 
 @check
 def cmd_stereo_leaves_channels_alone():
-    cmd = gv.ffmpeg_cmd("/tmp/o.mkv", "NTSC", True, gv.PROFILES["NTSC"], "src", False)
+    cmd = gv.ffmpeg_cmd("/tmp/o.mkv", "NTSC", [], gv.PROFILES["NTSC"], "src", False)
     assert "-af" not in cmd and "-ac" not in cmd
 
 
 @check
 def cmd_optional_outputs():
-    no_prev = gv.ffmpeg_cmd("/tmp/o.mkv", "NTSC", True, gv.PROFILES["NTSC"], "src", False)
+    no_prev = gv.ffmpeg_cmd("/tmp/o.mkv", "NTSC", [], gv.PROFILES["NTSC"], "src", False)
     assert no_prev.count("-map") == 2 and gv.PREVIEW not in no_prev
     assert "pulse" in no_prev  # the audio input stays; the monitor is a separate process
 
@@ -242,27 +284,27 @@ def default_sink_resolution():
 # ---------------------------------------------------------------- audio monitor
 @check
 def monitor_is_a_separate_process_with_pulse_sink():
-    cmd = gv.monitor_cmd("src", "alsa_output.speakers", False)
+    cmd = gv.monitor_cmd("src", "alsa_output.speakers", gv.MONO_AVERAGE)
     assert cmd[0] == "ffmpeg" and "-c:v" not in cmd  # never the recorder
     assert cmd[cmd.index("-i") + 1] == "src" and cmd[-3:] == ["-f", "pulse",
                                                               "alsa_output.speakers"]
-    assert cmd[cmd.index("-af") + 1] == gv.MONO_MAP
-    stereo = gv.monitor_cmd("src", "sink", True)
-    assert "-af" not in stereo  # stereo mode passes both channels through
+    assert cmd[cmd.index("-af") + 1] == "pan=mono|c0=0.5*c0+0.5*c1"
+    stereo = gv.monitor_cmd("src", "sink", [])
+    assert "-af" not in stereo and "-ac" not in stereo  # layout passed through
 
     started = {}
     with patch(owner=gv.subprocess,
                Popen=lambda cmd, **kw: started.update(cmd=cmd, env=kw.get("env")) or None):
-        assert gv.start_monitor("src", "sink.name", True) is None  # fake returns None
+        assert gv.start_monitor("src", "sink.name", []) is None  # fake returns None
         # ffmpeg's pulse output ignores the URL device: routing needs PULSE_SINK
         assert started["env"]["PULSE_SINK"] == "sink.name"
-        gv.start_monitor("src", "default", True)
+        gv.start_monitor("src", "default", [])
         assert "PULSE_SINK" not in started["env"]  # let pulse pick its own default
     with patch(owner=gv.subprocess,
                Popen=lambda *a, **k: (_ for _ in ()).throw(OSError("boom"))):
         out = io.StringIO()
         with contextlib.redirect_stderr(out):
-            assert gv.start_monitor("src", "sink", True) is None
+            assert gv.start_monitor("src", "sink", []) is None
         assert "cannot start the audio monitor" in out.getvalue()
 
 

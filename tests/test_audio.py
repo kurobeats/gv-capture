@@ -28,7 +28,10 @@ SCRIPT = Path(__file__).resolve().parents[1] / "gv-capture.py"
 QUICK = "--quick" in sys.argv
 RUN = 4 if QUICK else 6
 TONE_DB = -6  # sine source is already at 1/8 full scale (-18 dBFS), so -24 dBFS total
+# lavfi's sine is -18 dBFS peak, plus volume=-6dB. Levels are compared as mean/RMS:
+# peak on a lossy codec overshoots by ~3 dB from ringing, mean does not.
 EXPECTED_PEAK = -24.0
+EXPECTED_MEAN = EXPECTED_PEAK - 3.0
 RESULTS = []
 
 
@@ -63,11 +66,15 @@ def pulse_env():
     return dict(os.environ, XDG_RUNTIME_DIR=f"/run/user/{os.getuid()}")
 
 
-def peak_db(path):
-    """Peak level of a file, and its channel count."""
+def mean_db(path):
+    """Mean (RMS) level of a file and its channel count.
+
+    Mean, not peak: decoding a lossy codec lets a pure tone overshoot its real peak
+    by a few dB, which would make every level assertion flaky.
+    """
     r = sh(["ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "info", "-i", str(path),
             "-af", "volumedetect", "-f", "null", "-"])
-    m = re.search(r"max_volume: (-?[\d.]+|-inf) dB", r.stderr)
+    m = re.search(r"mean_volume: (-?[\d.]+|-inf) dB", r.stderr)
     need(m, f"no volume reading for {path}: {r.stderr[-300:]}")
     lvl = float("-inf") if m.group(1) == "-inf" else float(m.group(1))
     p = sh(["ffprobe", "-v", "error", "-select_streams", "a:0", "-show_entries",
@@ -75,11 +82,20 @@ def peak_db(path):
     return lvl, int(p.stdout.strip() or 0)
 
 
-def channel_peak(path, index):
-    """Peak of one channel, extracted with pan (works on any input layout)."""
+def peak_db(path):
+    """Peak level (clipping check only; lossy decode overshoots by a few tenths)."""
+    r = sh(["ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "info", "-i", str(path),
+            "-af", "volumedetect", "-f", "null", "-"])
+    m = re.search(r"max_volume: (-?[\d.]+|-inf) dB", r.stderr)
+    need(m, f"no peak reading for {path}: {r.stderr[-300:]}")
+    return float("-inf") if m.group(1) == "-inf" else float(m.group(1))
+
+
+def channel_mean(path, index):
+    """Mean level of one channel, extracted with pan (works on any input layout)."""
     r = sh(["ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "info", "-i", str(path),
             "-af", f"pan=mono|c0=c{index},volumedetect", "-f", "null", "-"])
-    m = re.search(r"max_volume: (-?[\d.]+|-inf) dB", r.stderr)
+    m = re.search(r"mean_volume: (-?[\d.]+|-inf) dB", r.stderr)
     need(m, f"no level for channel {index}: {r.stderr[-300:]}")
     return float("-inf") if m.group(1) == "-inf" else float(m.group(1))
 
@@ -106,12 +122,15 @@ class Sink:
     def monitor(self):
         return f"{self.name}.monitor"
 
-    def tone(self, seconds=14, left_only=True, db=TONE_DB):
-        """Start the tone into this sink; kill the process when done.
+    def tone(self, seconds=14, channel="left", db=TONE_DB):
+        """Start the tone in `channel` ("left", "right" or "both"); kill when done.
 
         PULSE_SINK, not the URL: ffmpeg's pulse output ignores the URL device.
         """
-        pan = "pan=stereo|c0=c0|c1=0*c0" if left_only else "pan=stereo|c0=c0|c1=c1"
+        # the sine source is mono, so both outputs take input channel 0
+        pan = {"left": "pan=stereo|c0=c0|c1=0*c0",
+               "right": "pan=stereo|c0=0*c0|c1=c0",
+               "both": "pan=stereo|c0=c0|c1=c0"}[channel]
         return subprocess.Popen(
             ["ffmpeg", "-hide_banner", "-loglevel", "error", "-re", "-f", "lavfi",
              "-i", f"sine=frequency=1000:sample_rate=48000:duration={seconds}",
@@ -245,11 +264,11 @@ def t_monitor_death_does_not_stop_recording(tmp):
     return "monitor killed mid-run: recording continued, exit 0, audio intact"
 
 
-def t_mono_gain_is_unity(tmp):
-    """-6 dBFS (i.e. -24 dBFS from lavfi) left-only tone must survive at full level."""
+def t_mono_downmix_keeps_both_channels(tmp):
+    """A tone on the RIGHT only must still be in the mono file: no channel is dropped."""
     with Lab() as lab:
-        out = tmp / "gain.mkv"
-        tone = lab.src.tone(seconds=14)
+        out = tmp / "right.mkv"
+        tone = lab.src.tone(seconds=14, channel="right")
         try:
             time.sleep(1.5)
             rc, log = capture(out, ["PAL", "mono"],
@@ -258,12 +277,81 @@ def t_mono_gain_is_unity(tmp):
             tone.kill()
             tone.wait()
         need(rc == 0, f"exit {rc}: {log[-400:]}")
-        lvl, chans = peak_db(out)
+        lvl, chans = mean_db(out)
         need(chans == 1, f"mono mode produced {chans}ch")
-        need(abs(lvl - EXPECTED_PEAK) <= 2.0,
-             f"peak {lvl:.1f} dBFS, expected {EXPECTED_PEAK:.1f} "
-             f"(an average downmix would give {EXPECTED_PEAK - 6:.1f})")
-        detail = f"mono peak {lvl:.1f} dBFS (expected {EXPECTED_PEAK:.1f}, no -6 dB loss)"
+        # averaging halves a single-channel signal: -24 dBFS peak in, -30 out.
+        # Silence here would mean the channel was discarded, which is what we guard.
+        need(abs(lvl - (EXPECTED_MEAN - 6)) <= 1.5,
+             f"mean {lvl:.1f} dBFS, expected about {EXPECTED_MEAN - 6:.1f} "
+             f"(silence would mean the right channel was dropped)")
+        detail = f"right-only tone survived the downmix at {lvl:.1f} dBFS mean"
+    return detail
+
+
+def t_default_keeps_the_source_layout(tmp):
+    """No layout argument: both channels recorded as they arrive."""
+    with Lab() as lab:
+        out = tmp / "default.mkv"
+        tone = lab.src.tone(seconds=14, channel="left")
+        try:
+            time.sleep(1.5)
+            rc, log = capture(out, ["PAL"], env=lab.env())  # no mono/stereo argument
+        finally:
+            tone.kill()
+            tone.wait()
+        need(rc == 0, f"exit {rc}: {log[-400:]}")
+        tracks = streams(out, "audio")
+        need(tracks and tracks[0]["channels"] == 2,
+             f"default captured {tracks[0]['channels'] if tracks else 0}ch, expected 2")
+        left, right = channel_mean(out, 0), channel_mean(out, 1)
+        need(abs(left - EXPECTED_MEAN) <= 1.5, f"left {left:.1f} dBFS mean, expected "
+             f"{EXPECTED_MEAN:.1f}")
+        need(right <= -60, f"right should be untouched silence, got {right:.1f}")
+        detail = f"2ch default: left {left:.1f}, right {right:.1f} dBFS mean"
+    return detail
+
+
+def t_mono_both_channels_keep_level(tmp):
+    """Both channels carrying the same tone: a downmix keeps the source level."""
+    with Lab() as lab:
+        out = tmp / "both.mkv"
+        tone = lab.src.tone(seconds=14, channel="both")
+        try:
+            time.sleep(1.5)
+            rc, log = capture(out, ["PAL", "mono"], env=lab.env())
+        finally:
+            tone.kill()
+            tone.wait()
+        need(rc == 0, f"exit {rc}: {log[-400:]}")
+        lvl, chans = mean_db(out)
+        need(chans == 1, f"mono mode produced {chans}ch")
+        need(abs(lvl - EXPECTED_MEAN) <= 1.5,
+             f"mean {lvl:.1f} dBFS, expected {EXPECTED_MEAN:.1f} "
+             f"(common-mode content must not be attenuated)")
+        detail = f"both channels at {lvl:.1f} dBFS mean after downmix"
+    return detail
+
+
+def t_mono_does_not_clip_common_mode(tmp):
+    """Both channels near full scale: a downmix must not push the file into clipping."""
+    with Lab() as lab:
+        out = tmp / "loud.mkv"
+        tone = lab.src.tone(seconds=14, channel="both", db=17)  # -1 dBFS per channel
+        try:
+            time.sleep(1.5)
+            rc, log = capture(out, ["PAL", "mono"], env=lab.env())
+        finally:
+            tone.kill()
+            tone.wait()
+        need(rc == 0, f"exit {rc}: {log[-400:]}")
+        peak, mean = peak_db(out), mean_db(out)[0]
+        need(peak <= -0.5, f"peak {peak:.1f} dBFS: the mixdown boosted into clipping "
+             f"(the source is at -1 dBFS)")
+        # tone at +17 dB over the usual setting: -1 dBFS peak per channel, so an
+        # honest average leaves -1 dBFS peak / about -4 dBFS mean
+        need(abs(mean - (EXPECTED_MEAN + 23)) <= 2.0, f"mean {mean:.1f} dBFS, expected "
+             f"about {EXPECTED_MEAN + 23:.1f}")
+        detail = f"peak {peak:.1f} dBFS, mean {mean:.1f}: no boost, no clipping"
     return detail
 
 
@@ -271,7 +359,7 @@ def t_stereo_keeps_both_channels(tmp):
     """stereo mode must not silently collapse to mono, and must keep the dead channel."""
     with Lab() as lab:
         out = tmp / "stereo.mkv"
-        tone = lab.src.tone(seconds=14, left_only=True)
+        tone = lab.src.tone(seconds=14, channel="left")
         try:
             time.sleep(1.5)
             rc, log = capture(out, ["PAL", "stereo"],
@@ -280,13 +368,13 @@ def t_stereo_keeps_both_channels(tmp):
             tone.kill()
             tone.wait()
         need(rc == 0, f"exit {rc}: {log[-400:]}")
-        lvl, chans = peak_db(out)
+        lvl, chans = mean_db(out)
         need(chans == 2, f"stereo mode produced {chans}ch")
-        left, right = channel_peak(out, 0), channel_peak(out, 1)
-        need(abs(left - EXPECTED_PEAK) <= 2.0, f"left channel {left:.1f} dBFS, "
-             f"expected {EXPECTED_PEAK:.1f}")
+        left, right = channel_mean(out, 0), channel_mean(out, 1)
+        need(abs(left - EXPECTED_MEAN) <= 1.5, f"left channel {left:.1f} dBFS mean, "
+             f"expected {EXPECTED_MEAN:.1f}")
         need(right <= -60, f"right channel should stay silent, got {right:.1f} dBFS")
-        detail = f"2ch kept: left {left:.1f} dBFS, right {right:.1f} dBFS"
+        detail = f"2ch kept: left {left:.1f}, right {right:.1f} dBFS mean"
     return detail
 
 
@@ -429,7 +517,10 @@ def t_audio_timestamps_monotonic(tmp):
 
 
 TESTS = [t_monitor_routes_to_gv_sink, t_monitor_death_does_not_stop_recording,
-         t_mono_gain_is_unity, t_stereo_keeps_both_channels, t_monitor_is_mono_in_mono_mode,
+         t_default_keeps_the_source_layout, t_mono_downmix_keeps_both_channels,
+         t_mono_both_channels_keep_level,
+         t_mono_does_not_clip_common_mode, t_stereo_keeps_both_channels,
+         t_monitor_is_mono_in_mono_mode,
          t_silent_track_is_reported, t_audible_track_is_not_flagged,
          t_feedback_loop_is_refused, t_monitor_only_sink_missing,
          t_audio_source_switch_is_followed,

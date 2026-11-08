@@ -5,10 +5,10 @@ with a live preview window and audio monitor, on a PipeWire/KDE desktop.
 
 ## Usage (on the capture host)
 
-    python3 gv-capture.py [outfile.mkv] [PAL|NTSC] [stereo|mono]
+    python3 gv-capture.py [outfile.mkv] [PAL|NTSC] [mono]
 
 - default output: `~/Videos/gv-<timestamp>.mkv`
-- audio is mixed down to mono by default; pass `stereo` to keep both channels
+- audio keeps the source layout by default; pass `mono` to mix both channels down
 - stop with Ctrl-C, `kill`, or by closing the preview window — the mkv is finalized cleanly
 - preview goes through a v4l2loopback device (/dev/video0, "OBS Virtual Camera"), shown
   uncropped at the device's own geometry (720x576 PAL / 720x486 NTSC)
@@ -28,11 +28,15 @@ Device overrides, when the names below move (udev renumbering, a different card)
 
 ## Audio
 
-The GV-USB2 sound chip is single-channel and lands on the **front-left** channel of a
-stereo pulse stream, with the right channel at the noise floor. So:
+The GV-USB2 delivers **stereo** audio; whether both channels carry signal depends on
+what is wired into it (a mono source feeding one input shows up on one channel only,
+with the other at the noise floor).
 
-- mono mode takes front-left at unity gain (an average downmix would cost 6 dB)
-- the monitor is fed mono in mono mode, so both speakers play it
+- default: the source layout is recorded as-is, so nothing is mixed or lost
+- `mono`: a normal downmix of both channels. Measured on this card's pulse stream:
+  both channels carrying the same signal stays at the same level, a signal on one
+  channel alone comes out 6 dB lower (that is what averaging does)
+- the monitor gets the same treatment as the file, so in `mono` both speakers play
 - the monitor is a **separate ffmpeg process**: if it dies (sink unplugged, wrong name)
   the recording keeps going and you get one warning
 - its sink is selected with `PULSE_SINK` in its environment — ffmpeg's pulse *output*
